@@ -1,0 +1,483 @@
+import middy from '@middy/core'
+import middyHttpHeaderNormalizer from '@middy/http-header-normalizer'
+import { APIGatewayProxyHandler } from 'aws-lambda'
+import fs from 'fs'
+import { DateTime } from 'luxon'
+import PDFDocument from 'pdfkit'
+import * as R from 'ramda'
+
+import { Log } from '../../../../../shared/logging/shared-logger'
+import { Store } from '../../../../shared/api/stores-api/generated/axios'
+import { BadRequestError, InternalServerError } from '../../../../shared/errors/errors'
+import { middyErrorHandler } from '../../../../shared/middleware/middy-error-handler'
+import { middyHttpRequestValidator } from '../../../../shared/middleware/middy-http-request-validator'
+import { middyXRayEgressHttp } from '../../../../shared/middleware/middy-x-ray-egress-http'
+import { middyCorrelationIds } from '../../../../shared/middleware/wrapper/middy-correlation-ids'
+import { findOrdersByDeliveryDate } from '../../data-sources/orders'
+import { findOrderState } from '../../data-sources/picking-state'
+import { ConstrainedProductV3, fetchEanToProductMap } from '../../data-sources/service/products'
+import { getStoreById, StoreInfo } from '../../data-sources/service/voikukka'
+import { DeliveryMethod } from '../../generated/graphql'
+import { middyAdAuth } from '../../middlewares/middy-ad-auth'
+import { middyEnsurePdfHeadersExist } from '../../middlewares/middy-pdf-headers'
+import { CartItem } from '../../types/cart-item'
+import { Order } from '../../types/order'
+import { OrderState } from '../../types/picking-state'
+import { formatFinnishDate, formatItemCount, formatItemPriceUnit } from '../../utils/format-texts'
+import { isNotNil } from '../../utils/misc-utils'
+import * as pdf from '../../utils/pdf'
+import { pdfResponse } from '../../utils/pdf'
+
+const S_KAUPAT_SVG = fs.readFileSync('src/assets/s-kaupat.svg', 'utf8')
+const HERKKU_SVG = fs.readFileSync('src/assets/foodmarketherkku.svg', 'utf8')
+const ICON_DELIVERY_SVG = fs.readFileSync('src/assets/icon-delivery-small.svg', 'utf8')
+const ICON_PICKUP_SVG = fs.readFileSync('src/assets/icon-pickup-small.svg', 'utf8')
+
+const NEW_PAGE_START_Y = 40
+const NEW_PAGE_Y_LIMIT = 790
+const MARGIN_HORIZONTAL = 32
+const MARGIN_HORIZONTAL_EXPANDED = 24
+
+const PAGE_WIDTH = 595
+const PAGE_HEIGHT = 842
+
+type GroupingType = 'delivery-time'
+
+type LogoInfo = { svg: string; width: number; height: number }
+const getStoreLogo = (store: Store): LogoInfo => {
+  switch (store.brand) {
+    case 'herkku':
+      return { svg: HERKKU_SVG, width: 68, height: 64 }
+    default:
+      return { svg: S_KAUPAT_SVG, width: 87, height: 34 }
+  }
+}
+
+const getIconForDeliveryMethod = (deliveryMethod: DeliveryMethod): string => {
+  switch (deliveryMethod) {
+    case 'HOME_DELIVERY':
+      return ICON_DELIVERY_SVG
+    case 'PICKUP':
+    default:
+      return ICON_PICKUP_SVG
+  }
+}
+
+const formatDateWithWeekday = (date: string): string => {
+  const weekday = ['ma', 'ti', 'ke', 'to', 'pe', 'la', 'su'][DateTime.fromISO(date).weekday - 1]
+  return `${weekday} ${formatFinnishDate(date)}`
+}
+
+type ServiceCounterItem = {
+  name: string
+  orderNumber: number
+  deliveryTime: string
+  ean: string
+  itemCount: string
+  basicQuantityUnit: string
+  canReplace: boolean
+  additionalInfo: string | undefined
+  deliveryMethod: DeliveryMethod
+  toteCode: string
+  price: number
+}
+
+type ServiceCounterItemGroup = {
+  title: string
+  items: ServiceCounterItem[]
+}
+
+type Report = 'bakingpoint' | 'servicedesk'
+
+const ReportNames = <Record<Report, string>>{
+  bakingpoint: 'Paistopisteraportti',
+  servicedesk: 'Palvelupisteraportti',
+}
+
+const isServiceCounterProduct = (product?: ConstrainedProductV3): boolean => {
+  const serviceDeskSatoDGs = [
+    'FBB', // 4 PALVELU: LIHA,KALA,VALMISR. (FBB)
+    'FBD', // 4 PALVELU: SUSHIBAARI (FBD)
+    'FDB', // 4 PALVELU: KOND.TUOT.,LEIPÄ, K(FDB)
+    'FFL', // 4 PALVELU MAKEISET (FFL)
+    'FHD', // 4 PALVELU JUOMAT (FHD)
+  ]
+
+  const serviceDeskSatoDGBlackList = [
+    'FBBG', // 5 VALINTA:RAVINTOLAM.VALMISR (FBBG)
+  ]
+
+  const { satoMarketDG } = product ?? {}
+  return satoMarketDG
+    ? serviceDeskSatoDGs.some((dg) => satoMarketDG.startsWith(dg)) &&
+        serviceDeskSatoDGBlackList.every((dg) => !satoMarketDG.startsWith(dg))
+    : false
+}
+
+const isBakingPointProduct = (product?: ConstrainedProductV3): boolean => {
+  const bakingPointSatoDg = 'FDA' // 3 Paistopiste-,Sulatet Ja Irtotuot
+  return product?.satoMarketDG?.startsWith(bakingPointSatoDg) ?? false
+}
+
+const toServiceCounterItem = (
+  order: Order,
+  cartItem: CartItem,
+  orderState?: OrderState,
+): ServiceCounterItem => {
+  return {
+    ...R.pick(['name', 'ean', 'itemCount', 'basicQuantityUnit', 'price'], cartItem),
+    ...R.pick(['orderNumber', 'deliveryTime'], order),
+    canReplace: cartItem.replace,
+    additionalInfo: cartItem.additionalInfo,
+    deliveryMethod: order.deliveryMethod,
+    toteCode: orderState?.toteCode ?? '',
+    price: cartItem.price,
+  }
+}
+
+const itemGroup = (groupingType: GroupingType) => (item: ServiceCounterItem): string => {
+  switch (groupingType) {
+    case 'delivery-time':
+    default:
+      return item.deliveryTime
+  }
+}
+
+const fetchOrderStates = async (orders: Order[]): Promise<OrderState[]> => {
+  try {
+    const states = (await Promise.all(orders.map(async (o) => await findOrderState(o.id)))).filter(
+      isNotNil,
+    )
+    return states
+  } catch (e) {
+    Log.warn('Service counter report - failed at getting toteCodes', {}, e)
+    return []
+  }
+}
+
+const fetchItems = async (
+  storeId: string,
+  deliveryDate: string,
+  groupingType: GroupingType = 'delivery-time',
+  report: Report,
+): Promise<ServiceCounterItemGroup[]> => {
+  const orders = await findOrdersByDeliveryDate(storeId, deliveryDate)
+
+  const orderStates = await fetchOrderStates(orders)
+
+  const productMap = await fetchEanToProductMap(
+    storeId,
+    orders.flatMap((o) => o.cartItems.map(R.prop('ean'))),
+  )
+  const serviceCounterCartItems = orders.flatMap((order) =>
+    order.cartItems
+      .filter((c) =>
+        report == 'bakingpoint'
+          ? isBakingPointProduct(productMap[c.ean])
+          : isServiceCounterProduct(productMap[c.ean]),
+      )
+      .map((item) =>
+        toServiceCounterItem(
+          order,
+          item,
+          orderStates.find((os) => os.refOrderId === order.id),
+        ),
+      ),
+  )
+
+  const groups = Object.entries(
+    R.groupBy(itemGroup(groupingType), serviceCounterCartItems),
+  ).map(([title, items]) => ({ title, items: R.sortBy((i) => i.deliveryTime + i.name, items) }))
+
+  // Make "Muut" be  last
+  return R.sortBy((g) => (g.title === 'Muut' ? 'ÖÖ' : g.title), groups)
+}
+
+const addPage = (doc: typeof PDFDocument): number => {
+  doc.addPage({ size: [PAGE_WIDTH, PAGE_HEIGHT], margin: 0 })
+  return NEW_PAGE_START_Y
+}
+
+const renderHeader = (
+  doc: PDFKit.PDFDocument,
+  store: Store,
+  deliveryDate: string,
+  report: Report,
+): void => {
+  pdf.renderSvgToPdf(
+    doc,
+    getStoreLogo(store).svg,
+    MARGIN_HORIZONTAL,
+    40 - getStoreLogo(store).height / 3.2,
+    {},
+  )
+
+  const title = ReportNames[report]
+
+  pdf.text(doc, `${title} ${formatDateWithWeekday(deliveryDate)}`, {
+    x: MARGIN_HORIZONTAL + getStoreLogo(store).width,
+    y: 28,
+    fontSize: 20,
+    bold: true,
+    paragraphGap: 0,
+  })
+
+  if (store.storeName) {
+    pdf.text(doc, store.storeName, {
+      x: MARGIN_HORIZONTAL + getStoreLogo(store).width,
+      y: 47,
+      fontSize: 11,
+      paragraphGap: 0,
+      color: '#777777',
+    })
+  }
+
+  doc
+    .moveTo(MARGIN_HORIZONTAL_EXPANDED, 76)
+    .lineTo(PAGE_WIDTH - MARGIN_HORIZONTAL_EXPANDED, 76)
+    .lineWidth(0.5)
+    .strokeColor('#D8D8D8')
+    .stroke()
+}
+
+const renderPageMetadata = (
+  doc: typeof PDFDocument,
+  deliveryDate: string,
+  report: Report,
+): void => {
+  const pages = doc.bufferedPageRange()
+  for (let i = 0; i < pages.count; i++) {
+    doc.switchToPage(i)
+    pdf.text(doc, `${i + 1} / ${pages.count}`, {
+      x: PAGE_WIDTH - MARGIN_HORIZONTAL - 100,
+      y: 16,
+      width: 100,
+      align: 'right',
+      fontSize: 11,
+    })
+    const title = ReportNames[report]
+
+    const isFirstPage = i === 0
+    if (!isFirstPage) {
+      pdf.text(doc, `${title} ${formatDateWithWeekday(deliveryDate)}`, {
+        x: MARGIN_HORIZONTAL,
+        y: 16,
+        fontSize: 11,
+      })
+    }
+  }
+}
+
+const renderTableHeaders = (doc: typeof PDFDocument, y: number): number => {
+  pdf.text(doc, 'Tuote', { x: MARGIN_HORIZONTAL, y, bold: true, fontSize: 11 })
+
+  pdf.text(doc, 'Määrä', {
+    x: 240,
+    y,
+    bold: true,
+    fontSize: 11,
+  })
+
+  pdf.text(doc, 'Kilohinta', {
+    x: 280,
+    y: y,
+    bold: true,
+    fontSize: 11,
+  })
+
+  pdf.text(doc, 'Saa\nkorvata?', {
+    x: 330,
+    y: y - 0.6,
+    bold: true,
+    fontSize: 11,
+    paragraphGap: 0,
+  })
+
+  pdf.text(doc, 'Tilaus', {
+    x: 385,
+    y,
+    bold: true,
+    fontSize: 11,
+  })
+
+  pdf.text(doc, 'Kommentti', {
+    x: 455,
+    y,
+    bold: true,
+    fontSize: 11,
+  })
+  return y + 24
+}
+
+const renderRow = (doc: PDFKit.PDFDocument, row: ServiceCounterItem, y: number): number => {
+  const yBeforeName = y
+
+  doc
+    .strokeColor('#BBBBBB')
+    .lineWidth(0.5)
+    .rect(MARGIN_HORIZONTAL - 18, y, 10, 10)
+    .stroke()
+
+  pdf.text(doc, row.ean, {
+    x: MARGIN_HORIZONTAL,
+    y: y - 8,
+    fontSize: 9,
+    color: '#777777',
+  })
+
+  pdf.text(doc, row.name, {
+    x: MARGIN_HORIZONTAL,
+    y,
+    fontSize: 11,
+    width: 240 - MARGIN_HORIZONTAL - 10,
+  })
+  const nameLines = Math.floor((doc.y - yBeforeName) / 16) + 1
+
+  pdf.text(
+    doc,
+    `${formatItemCount(row.itemCount, row.basicQuantityUnit)} ${
+      row.basicQuantityUnit
+    }`.toLowerCase(),
+    {
+      x: 240,
+      y,
+      fontSize: 11,
+    },
+  )
+
+  pdf.text(doc, `${formatItemPriceUnit(row.price, row.basicQuantityUnit)}`.toLowerCase(), {
+    x: 280,
+    y,
+    fontSize: 11,
+  })
+
+  pdf.text(doc, row.canReplace ? 'KYLLÄ' : 'EI', {
+    x: 335,
+    y,
+    fontSize: 11,
+  })
+
+  pdf.renderSvgToPdf(doc, getIconForDeliveryMethod(row.deliveryMethod), 379, y, {
+    assumePt: true,
+  })
+
+  pdf.text(doc, `#${row.orderNumber} ${row.toteCode}`, {
+    x: 389,
+    y,
+    width: 120,
+    fontSize: 10,
+    paragraphGap: 0,
+  })
+
+  const yBeforeComment = y
+  pdf.text(doc, row.additionalInfo ?? '', {
+    x: 455,
+    y: y - 32,
+    width: PAGE_WIDTH - 450 - 20,
+    fontSize: 11,
+  })
+
+  const commentLines = Math.floor((doc.y - yBeforeComment) / 16) + 1
+
+  return y + 18 + Math.max(commentLines - 0.5, nameLines) * 12
+}
+
+const renderItems = (doc: PDFKit.PDFDocument, groups: ServiceCounterItemGroup[]): void => {
+  const START_Y = 98
+  let currentY = START_Y
+
+  currentY = renderTableHeaders(doc, currentY)
+  for (const group of groups) {
+    if (currentY > NEW_PAGE_Y_LIMIT - 20) {
+      currentY = addPage(doc)
+      currentY = renderTableHeaders(doc, currentY)
+    }
+
+    pdf.text(doc, group.title, { fontSize: 11, bold: true, x: MARGIN_HORIZONTAL, y: currentY })
+    currentY += 22
+
+    for (const [, item] of group.items.entries()) {
+      if (currentY > NEW_PAGE_Y_LIMIT) {
+        currentY = addPage(doc)
+        currentY = renderTableHeaders(doc, currentY)
+      }
+
+      currentY = renderRow(doc, item, currentY)
+    }
+  }
+}
+
+const renderFooter = (doc: typeof PDFDocument, store: Store): void => {
+  const logoY = PAGE_HEIGHT - getStoreLogo(store).height - 10
+  if (doc.y > logoY - 10) {
+    return
+  }
+
+  pdf.renderSvgToPdf(doc, getStoreLogo(store).svg, MARGIN_HORIZONTAL, logoY)
+}
+
+const generate = (
+  store: StoreInfo,
+  groups: ServiceCounterItemGroup[],
+  deliveryDate: string,
+  report: Report,
+) => (doc: PDFKit.PDFDocument): void => {
+  addPage(doc)
+
+  renderHeader(doc, store, deliveryDate, report)
+  renderItems(doc, groups)
+  renderFooter(doc, store)
+
+  renderPageMetadata(doc, deliveryDate, report)
+}
+
+const handlerFn: APIGatewayProxyHandler = async (event) => {
+  const { storeId, deliveryDate, groupBy, report: reportParam } = event.queryStringParameters || {}
+  const report: Report = reportParam === 'bakingpoint' ? 'bakingpoint' : 'servicedesk'
+
+  if (!storeId || !deliveryDate) {
+    Log.error('store id and deliveryDate must be given as query parameter', {})
+    throw new BadRequestError({
+      message: 'store id and deliveryDate must be given as query parameter',
+    })
+  }
+
+  const [store, items] = await Promise.all([
+    getStoreById(storeId),
+    fetchItems(storeId, deliveryDate, groupBy as GroupingType, report),
+  ])
+
+  if (!store) {
+    throw new BadRequestError({
+      message: `Store ${storeId} not found`,
+      logData: { storeId },
+    })
+  }
+
+  try {
+    const pdfBuffer = await pdf.createPdf(generate(store, items, deliveryDate, report))
+    return pdfResponse(pdfBuffer)
+  } catch (error) {
+    const message = (error as { message: unknown }).message
+    Log.error('Internal server error generating service counter report PDF', {
+      error,
+      message,
+      storeId,
+      deliveryDate,
+      groupBy,
+    })
+    throw new InternalServerError({
+      message: 'Unable to generate service counter report pdf',
+      logData: { error, deliveryDate },
+    })
+  }
+}
+
+export const handler = middy(handlerFn)
+  .use(middyHttpHeaderNormalizer())
+  .use(middyEnsurePdfHeadersExist())
+  .use(middyHttpRequestValidator({ openApiJsonSpecPath: './openapi/generated/openapi.json' }))
+  .use(middyAdAuth())
+  .use(middyCorrelationIds())
+  .use(middyXRayEgressHttp())
+  .use(middyErrorHandler())
